@@ -205,6 +205,7 @@ pub(crate) fn extract_face_8x8_with_hat(
 
 pub struct MenuOverlayPipeline {
     pipeline: vk::Pipeline,
+    unorm_pipeline: Option<vk::Pipeline>,
     /// Vanilla `RenderPipelines.CROSSHAIR`: same shaders, INVERT blend.
     invert_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -260,11 +261,13 @@ pub struct MenuOverlayPipeline {
 }
 
 impl MenuOverlayPipeline {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &vk::Device,
         queue: vk::Queue,
         command_pool: vk::CommandPool,
         render_pass: vk::RenderPass,
+        unorm_render_pass: Option<vk::RenderPass>,
         allocator: &Arc<Mutex<Allocator>>,
         font_sources: FontSources<'_>,
         font_layer_limit: u32,
@@ -306,6 +309,8 @@ impl MenuOverlayPipeline {
             .expect("failed to create menu overlay pipeline layout");
 
         let pipeline = create_pipeline(device, render_pass, pipeline_layout, false);
+        let unorm_pipeline =
+            unorm_render_pass.map(|pass| create_pipeline(device, pass, pipeline_layout, false));
         let invert_pipeline = create_pipeline(device, render_pass, pipeline_layout, true);
 
         let pool_sizes = [
@@ -582,6 +587,7 @@ impl MenuOverlayPipeline {
 
         Ok(Self {
             pipeline,
+            unorm_pipeline,
             invert_pipeline,
             pipeline_layout,
             globals_layout,
@@ -697,6 +703,48 @@ impl MenuOverlayPipeline {
         elements: &[MenuElement],
         item_atlas_uvs: &HashMap<String, [f32; 4]>,
         vertex_base: u32,
+    ) -> u32 {
+        self.draw_from_internal(
+            cmd,
+            screen_w,
+            screen_h,
+            elements,
+            item_atlas_uvs,
+            vertex_base,
+            false,
+        )
+    }
+
+    pub fn draw_unorm_background(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        screen_w: f32,
+        screen_h: f32,
+        element: &MenuElement,
+        item_atlas_uvs: &HashMap<String, [f32; 4]>,
+        vertex_base: u32,
+    ) -> u32 {
+        self.draw_from_internal(
+            cmd,
+            screen_w,
+            screen_h,
+            std::slice::from_ref(element),
+            item_atlas_uvs,
+            vertex_base,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_from_internal(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        screen_w: f32,
+        screen_h: f32,
+        elements: &[MenuElement],
+        item_atlas_uvs: &HashMap<String, [f32; 4]>,
+        vertex_base: u32,
+        use_unorm: bool,
     ) -> u32 {
         let globals: [f32; 2] = [screen_w, screen_h];
         self.globals_allocation
@@ -944,9 +992,12 @@ impl MenuOverlayPipeline {
                     w,
                     h,
                     item_name,
+                    item_tints,
                     tint,
+                    ..
                 } => {
-                    if let Some(uv) = item_atlas_uvs.get(item_name) {
+                    let atlas_key = item_icon_atlas_key(item_name, item_tints);
+                    if let Some(uv) = item_atlas_uvs.get(&atlas_key) {
                         push_quad(
                             &mut vertices,
                             *x,
@@ -1013,6 +1064,10 @@ impl MenuOverlayPipeline {
                         &mut obfuscation_rng,
                     );
                     rotate_verts(&mut vertices[start..], *pivot, *rotation);
+                }
+                MenuElement::VanillaTransparentBackground { w, h } => {
+                    let (top, bottom) = vanilla_backdrop_colors(use_unorm);
+                    push_gradient_rect(&mut vertices, 0.0, 0.0, *w, *h, 0.0, top, bottom);
                 }
                 MenuElement::GradientRect {
                     x,
@@ -1175,6 +1230,7 @@ impl MenuOverlayPipeline {
                 y,
                 title,
                 items,
+                item_tints,
                 selected,
                 weight,
                 scale,
@@ -1198,6 +1254,7 @@ impl MenuOverlayPipeline {
                     BundleImage {
                         title,
                         items,
+                        item_tints,
                         selected: *selected,
                         weight: *weight,
                     },
@@ -1311,6 +1368,8 @@ impl MenuOverlayPipeline {
                     vk::PipelineBindPoint::Graphics,
                     if op.invert {
                         self.invert_pipeline
+                    } else if use_unorm {
+                        self.unorm_pipeline.unwrap_or(self.pipeline)
                     } else {
                         self.pipeline
                     },
@@ -1753,6 +1812,7 @@ impl MenuOverlayPipeline {
                             obfuscation_rng,
                             item_atlas_uvs,
                             data,
+                            image.item_tints.get(visual).map_or(&[], Vec::as_slice),
                             (x + 4.0 * px, y + 4.0 * px),
                             scale,
                             px,
@@ -1862,12 +1922,13 @@ impl MenuOverlayPipeline {
         obfuscation_rng: &mut ObfuscationRng,
         item_atlas_uvs: &HashMap<String, [f32; 4]>,
         data: &azalea_inventory::ItemStackData,
+        item_tints: &[u32],
         (x, y): (f32, f32),
         scale: f32,
         px: f32,
     ) {
         let name = crate::player::inventory::item_resource_name(data.kind);
-        if let Some(uv) = item_atlas_uvs.get(&name) {
+        if let Some(uv) = item_atlas_uvs.get(&item_icon_atlas_key(&name, item_tints)) {
             push_quad(
                 vertices,
                 x,
@@ -1966,11 +2027,21 @@ impl MenuOverlayPipeline {
         }
     }
 
-    pub fn recreate_pipeline(&mut self, device: &vk::Device, render_pass: vk::RenderPass) {
+    pub fn recreate_pipeline(
+        &mut self,
+        device: &vk::Device,
+        render_pass: vk::RenderPass,
+        unorm_render_pass: Option<vk::RenderPass>,
+    ) {
         device.destroy_pipeline(self.pipeline, None);
         device.destroy_pipeline(self.invert_pipeline, None);
+        if let Some(pipeline) = self.unorm_pipeline.take() {
+            device.destroy_pipeline(pipeline, None);
+        }
         self.pipeline = create_pipeline(device, render_pass, self.pipeline_layout, false);
         self.invert_pipeline = create_pipeline(device, render_pass, self.pipeline_layout, true);
+        self.unorm_pipeline = unorm_render_pass
+            .map(|pass| create_pipeline(device, pass, self.pipeline_layout, false));
     }
 
     pub fn destroy(&mut self, device: &vk::Device, allocator: &Arc<Mutex<Allocator>>) {
@@ -2042,6 +2113,9 @@ impl MenuOverlayPipeline {
 
         device.destroy_pipeline(self.pipeline, None);
         device.destroy_pipeline(self.invert_pipeline, None);
+        if let Some(pipeline) = self.unorm_pipeline.take() {
+            device.destroy_pipeline(pipeline, None);
+        }
         device.destroy_pipeline_layout(self.pipeline_layout, None);
         device.destroy_descriptor_pool(self.descriptor_pool, None);
         device.destroy_descriptor_set_layout(self.globals_layout, None);
@@ -2077,8 +2151,24 @@ impl TooltipLine {
     }
 }
 
+pub fn item_icon_atlas_key(item_name: &str, item_tints: &[u32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut key = format!("{item_name}#");
+    for color in item_tints {
+        let _ = write!(key, "{color:06x}-");
+    }
+    key
+}
+
 #[allow(dead_code)]
 pub enum MenuElement {
+    /// Full-screen in-world backdrop; native UNORM when supported, fitted sRGB
+    /// otherwise.
+    VanillaTransparentBackground {
+        w: f32,
+        h: f32,
+    },
     ScissorPush {
         x: f32,
         y: f32,
@@ -2155,6 +2245,11 @@ pub enum MenuElement {
         w: f32,
         h: f32,
         item_name: String,
+        item_stack: Option<azalea_inventory::ItemStackData>,
+        /// Vanilla GUI `item(...)` supplies the local LivingEntity owner;
+        /// `fakeItem(...)` supplies none. Team tint evaluation depends on this.
+        use_player_team: bool,
+        item_tints: Vec<u32>,
         tint: [f32; 4],
     },
     McText {
@@ -2209,6 +2304,8 @@ pub enum MenuElement {
         y: f32,
         title: Vec<TextSpan>,
         items: Vec<azalea_inventory::ItemStack>,
+        /// Per-item tint palettes, parallel to `items`; filled by the renderer.
+        item_tints: Vec<Vec<u32>>,
         selected: i32,
         weight: crate::ui::bundle::Frac,
         scale: f32,
@@ -4303,6 +4400,23 @@ fn premultiplied([r, g, b, a]: [f32; 4]) -> [f32; 4] {
     [r * a, g * a, b * a, a]
 }
 
+fn vanilla_backdrop_colors(exact_unorm: bool) -> ([f32; 4], [f32; 4]) {
+    if exact_unorm {
+        let gray = 16.0 / 255.0;
+        (
+            [gray, gray, gray, 192.0 / 255.0],
+            [gray, gray, gray, 208.0 / 255.0],
+        )
+    } else {
+        // Minimax fit for sRGB linear-space blending vs vanilla UNORM-code blending.
+        const GRAY: f32 = 0.005_793_62;
+        (
+            [GRAY, GRAY, GRAY, 0.926_284_2],
+            [GRAY, GRAY, GRAY, 0.956_899_8],
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_gradient_rect(
     verts: &mut Vec<Vertex>,
@@ -4573,6 +4687,7 @@ struct TooltipBox {
 struct BundleImage<'a> {
     title: &'a [TextSpan],
     items: &'a [azalea_inventory::ItemStack],
+    item_tints: &'a [Vec<u32>],
     selected: i32,
     weight: crate::ui::bundle::Frac,
 }
@@ -5127,6 +5242,56 @@ fn create_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanilla_backdrop_unorm_matches_reference_gradient() {
+        let (top, bottom) = vanilla_backdrop_colors(true);
+        let gray = 16.0 / 255.0;
+        assert_eq!(top, [gray, gray, gray, 192.0 / 255.0]);
+        assert_eq!(bottom, [gray, gray, gray, 208.0 / 255.0]);
+
+        let mut vertices = Vec::new();
+        push_gradient_rect(&mut vertices, 0.0, 0.0, 100.0, 100.0, 0.0, top, bottom);
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].mode, 10.0);
+        assert_eq!(vertices[0].color, premultiplied(top));
+        assert_eq!(vertices[2].color, premultiplied(bottom));
+    }
+
+    #[test]
+    fn fitted_srgb_backdrop_bounds_error_across_all_byte_values() {
+        fn decode_srgb(c: f64) -> f64 {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn encode_srgb(c: f64) -> f64 {
+            if c <= 0.0031308 {
+                c * 12.92
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        let (top, bottom) = vanilla_backdrop_colors(false);
+        let mut max_error: f64 = 0.0;
+        for y in 0..=256 {
+            let t = f64::from(y) / 256.0;
+            let alpha = (192.0 + 16.0 * t) / 255.0;
+            let fitted_alpha = f64::from(top[3]) * (1.0 - t) + f64::from(bottom[3]) * t;
+            let fitted_gray = f64::from(top[0]);
+            for byte in 0..=255 {
+                let dst = f64::from(byte) / 255.0;
+                let vanilla = (16.0 / 255.0) * alpha + dst * (1.0 - alpha);
+                let approx = encode_srgb(
+                    fitted_gray * fitted_alpha + decode_srgb(dst) * (1.0 - fitted_alpha),
+                );
+                max_error = max_error.max((vanilla - approx).abs() * 255.0);
+            }
+        }
+        assert!(max_error <= 4.5, "maximum channel error: {max_error}/255");
+    }
 
     /// A tooltip at gui scale 1, where one gui unit is one framebuffer pixel.
     fn unscaled_tooltip(x: f32, y: f32) -> McTooltipDraw {
